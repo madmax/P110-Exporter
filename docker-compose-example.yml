@@ -2,7 +2,7 @@ version: '3'
 
 services:
   tapo-P110-exporter:
-    image: p110-exporter
+    image: cardif99/p110-exporter:latest
     container_name: p110-exporter
     volumes:
        - ./tapo.yaml:/app/tapo.yaml:ro
