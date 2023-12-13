@@ -1,8 +1,9 @@
 from contextlib import contextmanager
 from enum import Enum, auto
 from math import floor
-from time import time
 from time import sleep
+import time
+import requests
 
 from loguru import logger
 from prometheus_client import Histogram
@@ -64,20 +65,25 @@ def get_metrics():
 RED_SUCCESS = "SUCCESS"
 RED_FAILURE = "FAILURE"
 
+
 @contextmanager
 def time_observation(ip_address, room):
     caught = None
     status = RED_SUCCESS
-    start = time()
+    start = time.time()
 
     try:
         yield
     except Exception as e:
         status = RED_FAILURE
         caught = e
-    
-    duration = floor((time() - start) * 1000)
-    OBSERVATION_RED_METRICS.labels(ip_address=ip_address, room=room, success=status).observe(duration)
+
+    duration = floor((time.time() - start) * 1000)
+    OBSERVATION_RED_METRICS.labels(
+        ip_address=ip_address,
+        room=room,
+        success=status
+    ).observe(duration)
 
     logger.debug("observation completed", extra={
         "ip": ip_address, "room": room, "duration_ms": duration,
@@ -87,41 +93,42 @@ def time_observation(ip_address, room):
         raise caught
 
 
-class Collector:
-    def __init__(self, deviceMap, email_address, password):
-        def create_device(ip_address, room):
-            extra = {
-                "ip": ip_address,
-                "room": room,
-            }
-            logger.debug("connecting to device", extra=extra)
-            
-            exception_count = 0  # Counter for exceptions
-            
-            while True:
-                try:
-                    d = PyP110.P110(ip_address, email_address, password)
-                    d.handshake()
-                    d.login()
-                except Exception as e:
-                    exception_count += 1
-                    logger.error("failed to connect to device", extra=extra, exc_info=True)
-                    if exception_count >= 3:  # Return None after the third exception
-                        d = None
-                        break
-                    sleep(1)  # Sleep for 1 second after each exception
-                    continue
-                break
+def tapo_login(email_address, password, ip_address, room):
+    extra = {
+        "ip": ip_address,
+        "room": room,
+    }
+    logger.debug("connecting to device", extra=extra)
 
-            if d is not None:
-                logger.debug("successfully authenticated with device", extra=extra)
-            
-            return d
+    for _ in range(3):
+        try:
+            device = PyP110.P110(ip_address, email_address, password)
+            device.handshake()
+            device.login()
+        except Exception as e:
+            logger.error("failed to connect to device",
+                         extra=extra, exc_info=True)
+            device = None
+            sleep(1)  # Sleep for 1 second after each exception
+            continue
+
+        break
+
+    if device is not None:
+        logger.debug("successfully authenticated with device", extra=extra)
+
+    return device
+
+
+class Collector:
+    def __init__(self, deviceMap, tapo_email_address, tapo_password):
+        self.tapo_email_address = tapo_email_address
+        self.tapo_password = tapo_password
 
         self.devices = {
             room: (ip_address, device)
             for room, ip_address in deviceMap.items()
-            if (device := create_device(ip_address, room)) is not None
+            if (device := tapo_login(tapo_email_address, tapo_password, ip_address, room)) is not None
         }
 
     def get_device_data(self, device, ip_address, room):
@@ -132,29 +139,38 @@ class Collector:
             return device.getEnergyUsage()
 
     def collect(self):
-        logger.info("recieving prometheus metrics scrape: collecting observations")
+        logger.info(
+            "receiving prometheus metrics scrape: collecting observations")
 
         metrics = get_metrics()
         metrics[MetricType.DEVICE_COUNT].add_metric([], len(self.devices))
 
-        for room, (ip_addr, device) in self.devices.items():
+        for room, (ip_address, device) in self.devices.items():
             logger.info("performing observations for device", extra={
-                "ip": ip_addr, "room": room,
+                "ip": ip_address, "room": room,
             })
 
             try:
-                data = self.get_device_data(device, ip_addr, room)
+                data = self.get_device_data(device, ip_address, room)
 
-                labels = [ip_addr, room]
-                metrics[MetricType.TODAY_RUNTIME].add_metric(labels, data['today_runtime'])
-                metrics[MetricType.MONTH_RUNTIME].add_metric(labels, data['month_runtime'])
-                metrics[MetricType.TODAY_ENERGY].add_metric(labels, data['today_energy'])
-                metrics[MetricType.MONTH_ENERGY].add_metric(labels, data['month_energy'])
-                metrics[MetricType.CURRENT_POWER].add_metric(labels, data['current_power'])
+                labels = [ip_address, room]
+                metrics[MetricType.TODAY_RUNTIME].add_metric(
+                    labels, data['today_runtime'])
+                metrics[MetricType.MONTH_RUNTIME].add_metric(
+                    labels, data['month_runtime'])
+                metrics[MetricType.TODAY_ENERGY].add_metric(
+                    labels, data['today_energy'])
+                metrics[MetricType.MONTH_ENERGY].add_metric(
+                    labels, data['month_energy'])
+                metrics[MetricType.CURRENT_POWER].add_metric(
+                    labels, data['current_power'])
+            except requests.exceptions.RequestException as e:
+                logger.exception(e)
             except Exception as e:
+                if (str(e) == "Error code: 9999"):
+                    self.devices[room] = (ip_address, tapo_login(
+                        self.tapo_email_address, self.tapo_password, ip_address, room))
                 logger.exception("encountered exception during observation!")
 
         for m in metrics.values():
-            yield m        
-
-            
+            yield m
