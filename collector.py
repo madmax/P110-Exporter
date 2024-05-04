@@ -164,6 +164,10 @@ class Collector:
                     labels, data['month_energy'])
                 metrics[MetricType.CURRENT_POWER].add_metric(
                     labels, data['current_power'])
+            except requests.exceptions.HTTPError as e: 
+                logger.exception(e)
+                self.devices[room] = (ip_address, tapo_login(
+                    self.tapo_email_address, self.tapo_password, ip_address, room))
             except requests.exceptions.RequestException as e:
                 logger.exception(e)
             except Exception as e:
